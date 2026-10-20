@@ -8,11 +8,13 @@ import html
 import json
 import os
 import secrets
+import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import admin
 import db
 
 TOKEN = os.environ["BOT_TOKEN"]
@@ -40,7 +42,8 @@ CONSENT_TEXT = (
 HELP = {
     "admin": "🛠 <b>Команды администратора</b>\n\n"
     "/doctor_add ФИО — ссылка для подключения врача\n"
-    "/doctors — список врачей\n/doctor_remove ID — отключить врача\n/status — сводка",
+    "/doctors — список врачей\n/doctor_remove ID — отключить врача\n/status — сводка\n"
+    "/admin — ссылка для входа в веб-админку",
     "doctor": "🩺 <b>Команды врача</b>\n\n"
     "/newlink — новая ссылка для пациентов (старая перестанет работать)\n"
     "/patients — ваши пациенты\n\n"
@@ -118,6 +121,22 @@ def get_patient(tg_id):
     return db.one("SELECT * FROM patients WHERE tg_id = :t", t=tg_id)
 
 
+def log_session(doctor_id, patient_id, side):
+    """Журнал сессий для админки: одна строка на пару «врач — пациент» за день (по Москве).
+    Только ID, время и счётчики сообщений, без текста. Хранится 14 дней."""
+    try:
+        db.run(
+            "INSERT INTO chat_sessions AS s (day, doctor_id, patient_id, first_at, last_at, from_patient, from_doctor) "
+            "VALUES ((now() AT TIME ZONE 'Europe/Moscow')::date, :d, :p, now(), now(), :fp, :fd) "
+            "ON CONFLICT (day, doctor_id, patient_id) DO UPDATE SET last_at = now(), "
+            "from_patient = s.from_patient + :fp, from_doctor = s.from_doctor + :fd",
+            d=doctor_id, p=patient_id, fp=int(side == "patient"), fd=int(side == "doctor"),
+        )
+        db.run("DELETE FROM chat_sessions WHERE day < (now() AT TIME ZONE 'Europe/Moscow')::date - 14")
+    except Exception as exc:  # журнал не должен мешать доставке
+        print("session log failed:", type(exc).__name__, exc, flush=True)
+
+
 # --- Обработка обновлений -------------------------------------------------
 
 
@@ -165,6 +184,8 @@ def start(user_id, payload, message):
         return activate_doctor(user_id, payload[2:], message)
     if payload.startswith("p_"):
         return connect_patient(user_id, payload[2:])
+    if payload.startswith("i_"):
+        return connect_invited(user_id, payload[2:])
     if user_id in ADMIN_IDS:
         return send(user_id, "👋 Здравствуйте! Вы <b>администратор</b>.\n\n" + HELP["admin"])
     if get_doctor(user_id):
@@ -197,8 +218,8 @@ def activate_doctor(user_id, code, message):
     )
     send(user_id, f"🎉 <b>{e(invite['name'])}</b>, вы подключены как врач!\n\n"
          f"🔗 Ваша ссылка для пациентов:\n{deep_link('p_' + link)}\n\n" + HELP["doctor"])
-    for admin in ADMIN_IDS:
-        send(admin, f"✅ Врач <b>{e(invite['name'])}</b> активировал(а) ссылку.")
+    for admin_id in ADMIN_IDS:
+        send(admin_id, f"✅ Врач <b>{e(invite['name'])}</b> активировал(а) ссылку.")
 
 
 def cmd_link(doctor):
@@ -207,9 +228,7 @@ def cmd_link(doctor):
 
 
 def cmd_newlink(doctor):
-    link, link_hash = new_code()
-    db.run("UPDATE doctors SET link_hash = :l WHERE tg_id = :t", l=link_hash, t=doctor["tg_id"])
-    send(doctor["tg_id"], f"🔗 <b>Новая ссылка для пациентов</b>\n{deep_link('p_' + link)}\n\n<i>Старая больше не работает.</i>")
+    send(doctor["tg_id"], f"🔗 <b>Новая ссылка для пациентов</b>\n{new_doctor_link(doctor)}\n\n<i>Старая больше не работает.</i>")
 
 
 def cmd_patients(doctor):
@@ -245,6 +264,7 @@ def doctor_message(doctor, message):
         return send(doctor["tg_id"], "☝️ У вас несколько пациентов. Нажмите <b>«Ответить»</b> "
                     "на сообщении того, кому пишете.")
     forward(message, target["tg_id"], f"🩺 <b>{e(doctor['name'])}</b> · <i>врач</i>")
+    log_session(doctor["tg_id"], target["tg_id"], "doctor")
     react(doctor["tg_id"], message["message_id"])
 
 
@@ -272,11 +292,45 @@ def connect_patient(user_id, code):
     db.run(
         "INSERT INTO patients (tg_id, doctor_id, state) VALUES (:t, :d, 'consent') "
         "ON CONFLICT (tg_id) DO UPDATE SET doctor_id = :d, state = 'consent', "
-        "full_name = NULL, phone = NULL",
+        "full_name = NULL, phone = NULL, preapproved = false",
         t=user_id, d=doctor["tg_id"],
     )
+    ask_consent(user_id, doctor)
+
+
+def ask_consent(user_id, doctor):
     send(user_id, f"👋 Здравствуйте! Это резервный канал связи с врачом <b>{e(doctor['name'])}</b>.\n\n" + CONSENT_TEXT,
          reply_markup=buttons([("✅ Согласен", "consent:yes"), ("Не сейчас", "consent:no")]))
+
+
+def connect_invited(user_id, code):
+    """Личная ссылка пациента из админки: врач уже выбран, ФИО заполнено, подтверждение врача не нужно."""
+    invite = db.one(
+        "SELECT * FROM patient_invites WHERE code_hash = :h AND used_at IS NULL AND expires_at > now()",
+        h=hash_code(code),
+    )
+    if not invite:
+        return send(user_id, "⛔️ Ссылка недействительна: её уже использовали или срок истёк.")
+    if get_doctor(user_id):
+        return send(user_id, "⚠️ Врач не может подключиться как пациент.")
+    patient = get_patient(user_id)
+    if patient and patient["state"] == "active":
+        return send(user_id, "⚠️ Вы уже подключены к врачу. Чтобы сменить врача, "
+                    "отправьте /stop и откройте ссылку заново.")
+    db.run("UPDATE patient_invites SET used_at = now() WHERE code_hash = :h", h=invite["code_hash"])
+    db.run(
+        "INSERT INTO patients (tg_id, doctor_id, state, full_name, preapproved) "
+        "VALUES (:t, :d, 'consent', :n, true) "
+        "ON CONFLICT (tg_id) DO UPDATE SET doctor_id = :d, state = 'consent', "
+        "full_name = :n, phone = NULL, preapproved = true",
+        t=user_id, d=invite["doctor_id"], n=invite["full_name"],
+    )
+    ask_consent(user_id, get_doctor(invite["doctor_id"]))
+
+
+def ask_contact(user_id, text):
+    send(user_id, text, reply_markup={"keyboard": [[{"text": "📱 Поделиться контактом", "request_contact": True}]],
+                                      "resize_keyboard": True, "one_time_keyboard": True})
 
 
 def patient_message(patient, message):
@@ -289,9 +343,7 @@ def patient_message(patient, message):
         if not 3 <= len(name) <= 100:
             return send(user_id, "✍️ Напишите, пожалуйста, ФИО текстом, например: <i>Иванов Иван Иванович</i>.")
         db.run("UPDATE patients SET full_name = :n, state = 'contact' WHERE tg_id = :t", n=name, t=user_id)
-        return send(user_id, "📱 <b>Шаг 3 из 3.</b> Поделитесь номером телефона кнопкой внизу.",
-                    reply_markup={"keyboard": [[{"text": "📱 Поделиться контактом", "request_contact": True}]],
-                                  "resize_keyboard": True, "one_time_keyboard": True})
+        return ask_contact(user_id, "📱 <b>Шаг 3 из 3.</b> Поделитесь номером телефона кнопкой внизу.")
     if state == "contact":
         return save_contact(patient, message)
     if state == "pending":
@@ -302,6 +354,7 @@ def patient_message(patient, message):
     for msg_id in sent:
         db.run("INSERT INTO msg_map (doctor_id, message_id, patient_id) VALUES (:d, :m, :p) "
                "ON CONFLICT DO NOTHING", d=doctor["tg_id"], m=msg_id, p=user_id)
+    log_session(doctor["tg_id"], user_id, "patient")
     # Разговор по ТЗ живёт до 72 часов тишины; на первое сообщение нового разговора отвечаем.
     last = patient["last_msg_at"]
     db.run("UPDATE patients SET last_msg_at = now() WHERE tg_id = :t", t=user_id)
@@ -316,11 +369,18 @@ def save_contact(patient, message):
     # Аналог проверки подписи номера в MAX: принимаем только свой контакт с кнопки.
     if not contact or contact.get("user_id") != user_id:
         return send(user_id, "☝️ Нажмите кнопку <b>«Поделиться контактом»</b> внизу. Чужой контакт или номер текстом не подойдёт.")
+    doctor = get_doctor(patient["doctor_id"])
+    if patient["preapproved"]:
+        db.run("UPDATE patients SET phone = :p, state = 'active' WHERE tg_id = :t",
+               p=contact["phone_number"], t=user_id)
+        send(user_id, f"🎉 <b>Готово!</b> Вы подключены к врачу {e(doctor['name'])}.\n\n"
+             "Пишите прямо здесь: текст, фото, голосовые, видео и файлы.", reply_markup={"remove_keyboard": True})
+        return send(doctor["tg_id"], f"🆕 Подключён пациент <b>{e(patient['full_name'])}</b> "
+                    "(по приглашению администратора). Его сообщения будут приходить сюда.")
     db.run("UPDATE patients SET phone = :p, state = 'pending' WHERE tg_id = :t",
            p=contact["phone_number"], t=user_id)
     send(user_id, "📨 Заявка отправлена врачу. Как только он подтвердит, я напишу.",
          reply_markup={"remove_keyboard": True})
-    doctor = get_doctor(patient["doctor_id"])
     send(doctor["tg_id"],
          f"🆕 <b>Новая заявка от пациента</b>\n\n👤 {e(patient['full_name'])}\n📱 <code>{e(contact['phone_number'])}</code>",
          reply_markup=buttons([("✅ Подтвердить", f"approve:{user_id}"), ("❌ Отклонить", f"reject:{user_id}")]))
@@ -379,8 +439,12 @@ def handle_callback(query):
             return close("🕓 Этот вопрос уже не актуален.")
         if arg == "yes":
             log_consent(user_id, "accept")
-            db.run("UPDATE patients SET state = 'name' WHERE tg_id = :t", t=user_id)
             close(CONSENT_TEXT.rsplit("\n\n", 1)[0] + "\n\n✅ <b>Согласие получено</b>")
+            if patient["preapproved"]:  # ФИО уже внесла клиника, осталось подтвердить телефон
+                db.run("UPDATE patients SET state = 'contact' WHERE tg_id = :t", t=user_id)
+                return ask_contact(user_id, f"📱 <b>{e(patient['full_name'])}</b>, остался последний шаг: "
+                                   "поделитесь номером телефона кнопкой внизу.")
+            db.run("UPDATE patients SET state = 'name' WHERE tg_id = :t", t=user_id)
             return send(user_id, "✍️ <b>Шаг 2 из 3.</b> Напишите, пожалуйста, ваши ФИО полностью.")
         log_consent(user_id, "decline")
         db.run("DELETE FROM patients WHERE tg_id = :t", t=user_id)
@@ -392,25 +456,79 @@ def handle_callback(query):
             return close("🕓 Заявка уже обработана или отозвана.")
         doctor = get_doctor(user_id)
         if action == "approve":
-            db.run("UPDATE patients SET state = 'active' WHERE tg_id = :t", t=patient["tg_id"])
             close(f"✅ Пациент <b>{e(patient['full_name'])}</b> подключён. Его сообщения будут приходить сюда.")
-            return send(patient["tg_id"], f"🎉 <b>Готово!</b> Врач {e(doctor['name'])} подтвердил подключение.\n\n"
-                        "Пишите прямо здесь: текст, фото, голосовые, видео и файлы.")
+            return approve_patient(patient, doctor)
         db.run("DELETE FROM patients WHERE tg_id = :t", t=patient["tg_id"])
         close(f"❌ Заявка <b>{e(patient['full_name'])}</b> отклонена.")
         return send(patient["tg_id"], "😔 Врач отклонил заявку. Если это ошибка, попросите у него ссылку ещё раз.")
 
 
+def approve_patient(patient, doctor):
+    db.run("UPDATE patients SET state = 'active' WHERE tg_id = :t", t=patient["tg_id"])
+    send(patient["tg_id"], f"🎉 <b>Готово!</b> Врач {e(doctor['name'])} подтвердил подключение.\n\n"
+         "Пишите прямо здесь: текст, фото, голосовые, видео и файлы.")
+
+
 # --- Администратор --------------------------------------------------------
+# Те же действия вызывает веб-админка (admin.py), поэтому они вынесены в функции.
+
+
+def create_doctor_invite(name):
+    code, code_hash = new_code()
+    db.run("INSERT INTO doctor_invites (code_hash, name, expires_at) VALUES (:h, :n, now() + interval '14 days')",
+           h=code_hash, n=name)
+    return deep_link("d_" + code)
+
+
+def create_patient_invite(doctor_id, full_name):
+    code, code_hash = new_code()
+    db.run("INSERT INTO patient_invites (code_hash, doctor_id, full_name, expires_at) "
+           "VALUES (:h, :d, :n, now() + interval '14 days')", h=code_hash, d=doctor_id, n=full_name)
+    return deep_link("i_" + code)
+
+
+def new_doctor_link(doctor):
+    link, link_hash = new_code()
+    db.run("UPDATE doctors SET link_hash = :l WHERE tg_id = :t", l=link_hash, t=doctor["tg_id"])
+    return deep_link("p_" + link)
+
+
+def remove_doctor(doctor):
+    patients = db.run("SELECT tg_id FROM patients WHERE doctor_id = :d", d=doctor["tg_id"])
+    db.run("DELETE FROM msg_map WHERE doctor_id = :d", d=doctor["tg_id"])
+    db.run("DELETE FROM doctors WHERE tg_id = :d", d=doctor["tg_id"])
+    for p in patients:
+        send(p["tg_id"], "🚪 Врач больше не подключён к резервному каналу, ваша связка удалена.")
+    send(doctor["tg_id"], "🚪 Администратор отключил вас от бота.")
+    return len(patients)
+
+
+def remove_patient(patient):
+    db.run("DELETE FROM patients WHERE tg_id = :t", t=patient["tg_id"])
+    db.run("DELETE FROM msg_map WHERE patient_id = :t", t=patient["tg_id"])
+    send(patient["tg_id"], "🚪 Клиника отключила вас от резервного канала, ваши данные удалены.",
+         reply_markup={"remove_keyboard": True})
+    if patient["state"] in ("pending", "active"):
+        send(patient["doctor_id"], f"🚪 Администратор отключил пациента <b>{e(patient['full_name'])}</b>.")
+
+
+def move_patient(patient, doctor):
+    """Перепривязка подключённого пациента к другому врачу администратором."""
+    old = get_doctor(patient["doctor_id"])
+    db.run("UPDATE patients SET doctor_id = :d, state = 'active' WHERE tg_id = :t",
+           d=doctor["tg_id"], t=patient["tg_id"])
+    db.run("DELETE FROM msg_map WHERE patient_id = :t", t=patient["tg_id"])
+    send(patient["tg_id"], f"🔄 Теперь ваш врач здесь — <b>{e(doctor['name'])}</b>. Пишите как обычно.")
+    send(doctor["tg_id"], f"🆕 Администратор передал вам пациента <b>{e(patient['full_name'])}</b>.")
+    if old:
+        send(old["tg_id"], f"🔄 Пациент <b>{e(patient['full_name'])}</b> передан другому врачу.")
 
 
 def cmd_doctor_add(admin_id, name):
     if not name:
         return send(admin_id, "✍️ Укажите ФИО: <code>/doctor_add Смирнова Е. В.</code>")
-    code, code_hash = new_code()
-    db.run("INSERT INTO doctor_invites (code_hash, name, expires_at) VALUES (:h, :n, now() + interval '14 days')",
-           h=code_hash, n=name)
-    send(admin_id, f"🔗 <b>Ссылка для врача {e(name)}</b>\n{deep_link('d_' + code)}\n\n<i>Одноразовая, действует 14 дней.</i>")
+    link = create_doctor_invite(name)
+    send(admin_id, f"🔗 <b>Ссылка для врача {e(name)}</b>\n{link}\n\n<i>Одноразовая, действует 14 дней.</i>")
 
 
 def cmd_doctors(admin_id, _):
@@ -429,13 +547,8 @@ def cmd_doctor_remove(admin_id, arg):
     doctor = get_doctor(int(arg)) if arg.isdigit() else None
     if not doctor:
         return send(admin_id, "✍️ Укажите ID врача из /doctors: <code>/doctor_remove 123456</code>")
-    patients = db.run("SELECT tg_id FROM patients WHERE doctor_id = :d", d=doctor["tg_id"])
-    db.run("DELETE FROM msg_map WHERE doctor_id = :d", d=doctor["tg_id"])
-    db.run("DELETE FROM doctors WHERE tg_id = :d", d=doctor["tg_id"])
-    for p in patients:
-        send(p["tg_id"], "🚪 Врач больше не подключён к резервному каналу, ваша связка удалена.")
-    send(doctor["tg_id"], "🚪 Администратор отключил вас от бота.")
-    send(admin_id, f"✅ Врач <b>{e(doctor['name'])}</b> отключён, пациентов отвязано: {len(patients)}.")
+    count = remove_doctor(doctor)
+    send(admin_id, f"✅ Врач <b>{e(doctor['name'])}</b> отключён, пациентов отвязано: {count}.")
 
 
 def cmd_status(admin_id, _):
@@ -449,8 +562,16 @@ def cmd_status(admin_id, _):
          f"🟡 Заявок ждут врача: {s['pending']}\n⚪️ Заполняют анкету: {s['filling']}")
 
 
+def cmd_admin(admin_id, _):
+    link = admin.login_link(admin_id)
+    if not link:
+        return send(admin_id, "⚠️ Не знаю адрес сайта: не задан RENDER_EXTERNAL_URL.")
+    send(admin_id, f"🖥 <b>Вход в админку</b>\n{link}\n\n<i>Ссылка одноразовая и действует 10 минут. "
+         "Никому её не пересылайте.</i>")
+
+
 ADMIN_COMMANDS = {"/doctor_add": cmd_doctor_add, "/doctors": cmd_doctors,
-                  "/doctor_remove": cmd_doctor_remove, "/status": cmd_status}
+                  "/doctor_remove": cmd_doctor_remove, "/status": cmd_status, "/admin": cmd_admin}
 DOCTOR_COMMANDS = {"/link": cmd_link, "/newlink": cmd_newlink, "/patients": cmd_patients}
 
 
@@ -459,12 +580,16 @@ DOCTOR_COMMANDS = {"/link": cmd_link, "/newlink": cmd_newlink, "/patients": cmd_
 
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
+        if admin.owns(self.path):
+            return admin.handle(self, "GET")
         self._respond(200, b"ok")
 
     def do_HEAD(self):
         self._respond(200, b"")
 
     def do_POST(self):
+        if admin.owns(self.path):
+            return admin.handle(self, "POST")
         if self.path != WEBHOOK_PATH:
             return self._respond(404, b"not found")
         if self.headers.get("X-Telegram-Bot-Api-Secret-Token") != SECRET:
@@ -495,6 +620,7 @@ def set_webhook():
 
 if __name__ == "__main__":
     db.init()
+    admin.bot = sys.modules[__name__]  # админка вызывает функции бота из этого модуля
     BOT_USERNAME = call("getMe", {})["username"]
     set_webhook()
     port = int(os.environ.get("PORT", 10000))

@@ -11,6 +11,8 @@ from datetime import date, datetime, timedelta, timezone
 from http.cookies import SimpleCookie
 from urllib.parse import parse_qs, quote, urlparse
 
+import segno
+
 import db
 
 bot = None  # модуль бота, подставляет bot.py при запуске
@@ -413,7 +415,7 @@ def links_block(created):
     """Только что созданные ссылки: показываем один раз, в базе остаётся только хеш."""
     if not created:
         return ""
-    items = "".join(f"""<div class=link><div class=qr data-link="{e(link)}"></div><div>
+    items = "".join(f"""<div class=link><div class=qr>{qr_svg(link)}</div><div>
 <b>{e(name)}</b><div class=muted>{e(kind)}</div><input readonly value="{e(link)}" onclick="this.select()">
 <button class=ghost type=button onclick="navigator.clipboard.writeText('{e(link)}');this.textContent='Скопировано'">Копировать</button>
 </div></div>""" for name, link, kind in created)
@@ -425,6 +427,11 @@ def links_block(created):
 
 
 MSK = timezone(timedelta(hours=3))
+
+
+def qr_svg(link):
+    """QR-код рисуем на сервере: ссылка никуда не уходит."""
+    return segno.make(link, error="m").svg_inline(scale=3, border=2)
 
 
 def expired(invite):
@@ -464,8 +471,6 @@ def page(title, body, req=None, nav=True):
 <meta name=viewport content="width=device-width, initial-scale=1"><title>{e(title)} · Админка бота</title>
 <style>{CSS}</style></head><body><header><b>🏥 Админка бота</b>{menu}</header>
 <main><h1>{e(title)}</h1>{msg}{body}</main>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
-<script>document.querySelectorAll('.qr').forEach(el => {{ try {{ new QRCode(el, {{text: el.dataset.link, width: 120, height: 120}}); }} catch (e) {{}} }});</script>
 </body></html>"""
 
 
@@ -491,7 +496,7 @@ button.ghost,.btn{background:transparent;color:var(--accent);border:1px solid va
 .tile{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;text-decoration:none;color:var(--text)}
 .tile b{display:block;font-size:26px}.tile span{color:var(--muted);font-size:13px}
 .link{display:flex;gap:14px;align-items:center;padding:12px 0;border-top:1px solid var(--line)}.link input{width:100%;max-width:420px;margin:6px 0}
-.qr{background:#fff;padding:6px;border-radius:8px;flex:none;min-width:132px;min-height:132px}
+.qr{background:#fff;padding:4px;border-radius:8px;flex:none;line-height:0}
 @media (max-width:600px){.link{flex-direction:column;align-items:flex-start}}
 """
 

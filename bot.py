@@ -582,6 +582,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if admin.owns(self.path):
             return admin.handle(self, "GET")
+        if self.path == "/healthz":
+            return self._respond(200, b"ok-health-v1")
         self._respond(200, b"ok")
 
     def do_HEAD(self):
